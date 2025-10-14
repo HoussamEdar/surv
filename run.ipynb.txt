@@ -1,0 +1,907 @@
+ from flask import Flask, render_template, Response, request, jsonify, redirect, url_for, session, flash, stream_with_context
+import os
+os.environ.setdefault(
+    "OPENCV_FFMPEG_CAPTURE_OPTIONS",
+    "rtsp_transport;tcp|stimeout;10000000|rw_timeout;10000000|max_delay;500000"
+)
+
+import cv2
+import threading
+import queue
+import time
+import os
+import json
+import psutil
+import torch
+from ultralytics import YOLO
+from deep_sort_realtime.deepsort_tracker import DeepSort
+from flask_sqlalchemy import SQLAlchemy
+from werkzeug.security import generate_password_hash, check_password_hash
+from functools import wraps
+from flask_cors import CORS
+import requests
+from device_info import get_device_relevant_info  # Make sure this file is in your project
+from device_info import get_gpu_info_jetson
+from datetime import datetime
+import os
+os.environ.setdefault(
+    "OPENCV_FFMPEG_CAPTURE_OPTIONS",
+    "rtsp_transport;tcp|stimeout;10000000|rw_timeout;10000000|max_delay;500000"
+)
+
+app = Flask(__name__)
+CORS(app)
+app.secret_key = os.urandom(24)
+
+# Configure database
+#app.config['SQLALCHEMY_DATABASE_URI'] = 'mysql+pymysql://root:root@localhost:3307/DATABASENAME'
+app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
+db = SQLAlchemy(app)
+
+# Global variables
+
+from datetime import datetime
+
+camera_last_seen = {}
+alert_already_sent = {}
+
+# Initial cameras dictionary - update or extend via API
+cameras = {
+  #  "Camera 1": " RSTP LINK"
+     
+        }
+cameras_lock = threading.RLock()
+
+camera_workers = {}  # Map: camera_name -> CameraWorker
+tracker = DeepSort(max_age=30, n_init=5, max_cosine_distance=0.2, nn_budget=50, nms_max_overlap=0.3)
+loiter_memory = {}
+
+# Load YOLO model once globally
+device = 'cuda' if torch.cuda.is_available() else 'cpu'
+print(f"[INFO] Loading YOLO model on {device}")
+model = YOLO("yolo12n.pt").to(device)
+
+
+
+from datetime import datetime
+camera_status_cache = {}  # NEW: store health info here
+
+
+
+
+# Initial cameras dictionary - update or extend via API
+
+def get_all_camera_health():
+    now = datetime.now()
+    health_data = []
+    with cameras_lock:
+        items = list(cameras.items())
+
+    for camera_name, url in items:
+        status = 'offline'
+        last_seen = 'Never'
+        ip = extract_ip_from_rtsp(url)
+        fps = None
+
+        try:
+            cap = cv2.VideoCapture(url)
+            if cap.isOpened():
+                status = 'online'
+                last_seen = now.strftime('%Y-%m-%d %H:%M:%S')
+                camera_last_seen[camera_name] = now
+                alert_already_sent[camera_name] = False
+            else:
+                last_ok = camera_last_seen.get(camera_name)
+                if last_ok:
+                    elapsed = (now - last_ok).total_seconds()
+                    if elapsed > 30 and not alert_already_sent.get(camera_name, False):
+                        send_offline_email(camera_name)
+                        alert_already_sent[camera_name] = True
+            cap.release()
+        except Exception as e:
+            print(f"[Camera Health Error] {camera_name}: {e}")
+
+        health_data.append({
+            'name': camera_name,
+            'status': status,
+            'last_seen': last_seen,
+            'url': url,
+            'ip': ip,
+            'latency_ms': None,
+            'stream_fps': fps
+        })
+
+    return health_data
+
+
+
+
+
+
+
+camera_health_status = {}
+def background_camera_health_checker():
+    while True:
+        with app.app_context():
+            saved_cameras = read_camera_config() or {}
+            # if you don't use camera_config.json yet, fall back to in-memory dict
+            source_items = saved_cameras.items() if saved_cameras else cameras.items()
+
+            for camera_id, cam_config in source_items:
+                url = cam_config.get("url", "") if isinstance(cam_config, dict) else cam_config
+                host, port = host_port_from_rtsp(url)
+                is_online = is_rtsp_port_open(host, port=port)
+
+                camera_status_cache[camera_id] = {
+                    "name": camera_id,
+                    "rtsp_url": url,
+                    "status": "online" if is_online else "offline",
+                    "last_seen": datetime.now().strftime('%Y-%m-%d %H:%M:%S') if is_online else 'Never',
+                    "fps": "N/A",
+                    "latency": "N/A",
+                }
+
+                if not is_online:
+                    if camera_id not in alert_already_sent:
+                        send_offline_email(camera_id)
+                        alert_already_sent[camera_id] = True
+                else:
+                    alert_already_sent[camera_id] = False
+
+        time.sleep(30)
+
+
+
+
+class Camera(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    name = db.Column(db.String(100), unique=True, nullable=False)
+    feature = db.Column(db.String(50), nullable=False)
+    rtsp_url = db.Column(db.String(255))
+    stream_url = db.Column(db.String(255))  # Optional: you can alias this to rtsp_url
+    mode = db.Column(db.String(20))
+    status = db.Column(db.String(20), default='offline')
+    last_seen = db.Column(db.DateTime)
+    active = db.Column(db.Boolean, default=True)
+
+
+from urllib.parse import urlparse
+import socket
+import cv2
+import time
+from datetime import datetime
+
+def extract_ip_from_rtsp(rtsp_url):
+    try:
+        parsed = urlparse(rtsp_url)
+        return parsed.hostname or 'Unknown'
+    except:
+        return 'Unknown'
+        
+from urllib.parse import urlparse
+
+def host_port_from_rtsp(rtsp_url):
+    try:
+        p = urlparse(rtsp_url)
+        return p.hostname or 'Unknown', (p.port or 554)
+    except Exception:
+        return 'Unknown', 554
+
+def is_rtsp_port_open(ip, port=554, timeout=1):
+    try:
+        with socket.create_connection((ip, port), timeout=timeout):
+            return True
+    except:
+        return False
+
+
+
+
+
+
+
+
+
+
+
+event_logs = {name: [] for name in cameras}
+
+
+recent_activities = []
+
+def log_activity_event(message):
+    recent_activities.append({
+        "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "message": message
+    })
+    if len(recent_activities) > 50:
+        recent_activities.pop(0)
+
+class MailSettings(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    sender_email = db.Column(db.String(255), nullable=False)
+    sender_passkey = db.Column(db.String(255), nullable=False)
+    receiver_email = db.Column(db.String(255), nullable=False)
+    offline_threshold = db.Column(db.Integer, default=30) 
+    def __repr__(self):
+        return f'<MailSettings {self.sender_email}>'
+
+
+# Database models
+class User(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    username = db.Column(db.String(80), unique=True, nullable=False)
+    password = db.Column(db.String(200), nullable=False)
+    role = db.Column(db.String(20), default='user')
+
+    def __repr__(self):
+        return f'<User {self.username}>'
+
+class Settings(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    webhook_url = db.Column(db.String(255), nullable=True, default='')
+
+    def __repr__(self):
+        return f'<Settings {self.id}>'
+
+
+
+
+
+
+
+
+
+
+
+import smtplib
+from email.mime.text import MIMEText
+
+def send_offline_email(camera_name):
+    settings = MailSettings.query.first()
+    if not settings:
+        print("[Email Alert] No mail settings configured.")
+        return
+
+    sender = settings.sender_email
+    password = settings.sender_passkey
+    recipient = settings.receiver_email
+
+    subject = f"  Camera '{camera_name}' is offline"
+    body = f"The camera '{camera_name}' has been offline for more than 30 seconds."
+
+    msg = MIMEText(body)
+    msg["Subject"] = subject
+    msg["From"] = sender
+    msg["To"] = recipient
+
+    try:
+        server = smtplib.SMTP("smtp.gmail.com", 587)
+        server.starttls()
+        server.login(sender, password)
+        server.sendmail(sender, recipient, msg.as_string())
+        server.quit()
+        print(f"[Email Alert] Sent offline alert to {recipient}")
+    except Exception as e:
+        print(f"[Email Alert Error] Failed to send email: {e}")
+
+
+
+
+
+import json
+
+def read_camera_config():
+    try:
+        with open("camera_config.json", "r") as file:
+            return json.load(file)
+    except FileNotFoundError:
+        return {}
+
+
+
+
+
+def camera_health_worker():
+    while True:
+        with cameras_lock:
+            items = list(cameras.items())  # snapshot
+
+        for cam_id, rtsp_url in items:
+            host, port = host_port_from_rtsp(rtsp_url)
+            is_online = is_rtsp_port_open(host, port=port)
+
+            camera_status_cache[cam_id] = {
+                "name": cam_id,
+                "rtsp_url": rtsp_url,
+                "status": "online" if is_online else "offline",
+                "last_seen": datetime.now().strftime("%Y-%m-%d %H:%M:%S") if is_online else "Never",
+                "fps": "N/A",
+                "latency": "N/A",
+            }
+
+            if is_online:
+                camera_last_seen[cam_id] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+        time.sleep(10)
+
+
+
+
+
+threading.Thread(target=camera_health_worker, daemon=True).start()
+
+
+
+
+# Decorators
+def login_required(f):
+    @wraps(f)
+    def decorated_function(*args, **kwargs):
+        if 'user_id' not in session:
+            flash('Please login to access this page', 'error')
+            return redirect(url_for('login'))
+        return f(*args, **kwargs)
+    return decorated_function
+
+def admin_required(f):
+    @wraps(f)
+    def decorated_function(*args, **kwargs):
+        if 'user_id' not in session or session.get('role') != 'admin':
+            flash('Administrator privileges required', 'error')
+            return redirect(url_for('index'))
+        return f(*args, **kwargs)
+    return decorated_function
+
+# Helper function for ROI check
+def is_inside_roi(x1, y1, x2, y2, roi_px):
+    rx1, ry1, rw, rh = roi_px
+    rx2 = rx1 + rw
+    ry2 = ry1 + rh
+    return x1 >= rx1 and y1 >= ry1 and x2 <= rx2 and y2 <= ry2
+
+# Background worker for each camera stream
+class CameraWorker(threading.Thread):
+    def __init__(self, camera_name, rtsp_url, feature='human_tracking', mode='full', roi=None):
+        super().__init__()
+        self.camera_name = camera_name
+        self.rtsp_url = rtsp_url
+        self.feature = feature
+        self.mode = mode
+        self.roi = roi
+        self.running = threading.Event()
+        self.running.set()
+        self.frame_queue = queue.Queue(maxsize=1)  # Holds last processed frame
+
+    def run(self):
+        cap = cv2.VideoCapture(self.rtsp_url)
+        if not cap.isOpened():
+            print(f"[ERROR] Camera {self.camera_name} stream failed to open")
+            return
+
+        frame_skip = 5
+        count = 0
+        LOITER_THRESHOLD_SEC = 10
+        CROWD_THRESHOLD = 5
+
+        while self.running.is_set():
+            ret, frame = cap.read()
+            if not ret or frame is None:
+                print(f"[WARN] Camera {self.camera_name} frame read failed, retrying...")
+                time.sleep(1)
+                continue
+
+            count += 1
+            if count % frame_skip != 0:
+                continue
+
+            frame = cv2.resize(frame, (720, 530))
+
+            roi_px = None
+            if self.roi and self.mode == "custom":
+                rx = int(self.roi["x"] * frame.shape[1])
+                ry = int(self.roi["y"] * frame.shape[0])
+                rw = int(self.roi["w"] * frame.shape[1])
+                rh = int(self.roi["h"] * frame.shape[0])
+                roi_px = (rx, ry, rw, rh)
+                cv2.rectangle(frame, (rx, ry), (rx + rw, ry + rh), (255, 0, 0), 2)
+
+            detections = []
+            log_entries = []
+            timestamp = time.strftime('%Y-%m-%d %H:%M:%S')
+
+            results = model(frame)
+            for result in results[0].boxes.data.cpu().numpy():
+                x1, y1, x2, y2, conf, cls = result
+                if int(cls) == 0 and conf > 0.5:
+                    width, height = x2 - x1, y2 - y1
+                    if roi_px and not is_inside_roi(x1, y1, x2, y2, roi_px):
+                        continue
+                    detections.append(([x1, y1, width, height], conf))
+
+            if self.feature == "human_tracking":
+                tracks = tracker.update_tracks(detections, frame=frame)
+                for track in tracks:
+                    if not track.is_confirmed():
+                        continue
+                    track_id = track.track_id
+                    x1, y1, x2, y2 = map(int, track.to_ltrb())
+                    cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
+                    cv2.putText(frame, f'ID: {track_id}', (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+                    log_entries.append(f"[{timestamp}] [{self.camera_name}] Human ID {track_id} at ({x1},{y1})")
+
+            elif self.feature == "loitering_detection":
+                tracks = tracker.update_tracks(detections, frame=frame)
+                current_time = time.time()
+                for track in tracks:
+                    if not track.is_confirmed():
+                        continue
+                    track_id = track.track_id
+                    x1, y1, x2, y2 = map(int, track.to_ltrb())
+                    cx = (x1 + x2) // 2
+                    cy = (y1 + y2) // 2
+                    if track_id not in loiter_memory:
+                        loiter_memory[track_id] = (cx, cy, current_time)
+                    else:
+                        px, py, start_time = loiter_memory[track_id]
+                        dist = ((px - cx) ** 2 + (py - cy) ** 2) ** 0.5
+                        if dist < 50 and (current_time - start_time > LOITER_THRESHOLD_SEC):
+                            cv2.rectangle(frame, (x1, y1), (x2, y2), (255, 165, 0), 2)
+                            cv2.putText(frame, 'Loitering', (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 165, 0), 2)
+                            log_entries.append(f"[{timestamp}] [{self.camera_name}] Loitering ID {track_id} at approx. ({cx}, {cy}) >{LOITER_THRESHOLD_SEC}s")
+
+            elif self.feature == "crowd_counting":
+                person_count = len(detections)
+                cv2.putText(frame, f'People Count: {person_count}', (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
+                if person_count > CROWD_THRESHOLD:
+                    log_entries.append(f"[{timestamp}] [{self.camera_name}] Crowd Alert: {person_count} people detected")
+
+            if log_entries:
+                event_logs[self.camera_name] = log_entries[-10:]
+
+            # Put processed frame in queue (replace old frame)
+            if self.frame_queue.full():
+                try:
+                    self.frame_queue.get_nowait()
+                except queue.Empty:
+                    pass
+            self.frame_queue.put(frame)
+
+        cap.release()
+        print(f"[INFO] Camera worker {self.camera_name} stopped")
+
+    def stop(self):
+        self.running.clear()
+
+
+@app.route('/start_stream', methods=['POST'])
+@login_required
+def start_stream():
+    data = request.json
+    camera_name = data.get('camera')
+    rtsp_url = data.get('url')
+    feature = data.get('feature', 'human_tracking')
+    mode = data.get('mode', 'full')
+    roi = data.get('roi')
+
+    if not camera_name or not rtsp_url:
+        return jsonify({"status": "error", "message": "Camera name and RTSP URL required"}), 400
+
+    if camera_name in camera_workers and camera_workers[camera_name].running.is_set():
+        return jsonify({"status": "error", "message": "Stream already running"}), 400
+
+    worker = CameraWorker(camera_name, rtsp_url, feature, mode, roi)
+    worker.start()
+    camera_workers[camera_name] = worker
+    return jsonify({"status": "success", "message": f"Stream started for {camera_name}"})
+
+
+@app.route('/stop_stream', methods=['POST'])
+@login_required
+def stop_stream():
+    data = request.json
+    camera_name = data.get('camera')
+
+    if not camera_name:
+        return jsonify({"status": "error", "message": "Camera name required"}), 400
+
+    worker = camera_workers.get(camera_name)
+    if worker and worker.running.is_set():
+        worker.stop()
+        worker.join()
+        del camera_workers[camera_name]
+        log_activity_event(f"Stream for '{camera_name}' stopped by {session.get('username')}")
+        return jsonify({"status": "success", "message": f"Stream stopped for {camera_name}"})
+
+    return jsonify({"status": "error", "message": "Stream not found or already stopped"}), 404
+
+
+@app.route('/video')
+@login_required
+def video():
+    camera_name = request.args.get('camera')
+    if camera_name not in camera_workers:
+        return jsonify({"error": "Stream not running"}), 404
+
+    worker = camera_workers[camera_name]
+
+    def generate_frames():
+        while worker.running.is_set():
+            try:
+                frame = worker.frame_queue.get(timeout=5)
+                ret, buffer = cv2.imencode('.jpg', frame)
+                if not ret:
+                    continue
+                yield (b'--frame\r\nContent-Type: image/jpeg\r\n\r\n' + buffer.tobytes() + b'\r\n')
+            except queue.Empty:
+                continue
+
+    return Response(generate_frames(), mimetype='multipart/x-mixed-replace; boundary=frame')
+
+# Event logs streaming (unchanged)
+@app.route('/video_logs/<camera_name>')
+@login_required
+def video_logs(camera_name):
+    @stream_with_context
+    def event_stream():
+        last_sent = []
+        while True:
+            logs = event_logs.get(camera_name, [])
+            if logs != last_sent:
+                new_logs = [log for log in logs if log not in last_sent]
+                for log in new_logs:
+                    yield f"data: {log}\n\n"
+                last_sent = logs
+            time.sleep(1)
+    return Response(event_stream(), mimetype='text/event-stream')
+
+@app.route('/stop_streams', methods=['POST'])
+@login_required
+def stop_streams():
+    for worker in list(camera_workers.values()):
+        worker.stop()
+        worker.join()
+    camera_workers.clear()
+    log_activity_event(f"All streams stopped by {session.get('username')}")
+    return jsonify({"status": "all streams stopped"})
+
+# Activity logging (unchanged)
+@app.route('/log_activity', methods=['POST'])
+@login_required
+def log_activity():
+    data = request.json
+    device_id = data.get("device_id")
+    camera_name = data.get("camera_name")
+    feature = data.get("feature")
+    timestamp = data.get("timestamp")
+    log_message = data.get("log_message")
+    coordinates = data.get("coordinates")
+    ip_address = request.remote_addr
+    payload = {
+        "device_id": device_id,
+        "ip_address": ip_address,
+        "camera_name": camera_name,
+        "feature": feature,
+        "timestamp": timestamp,
+        "log_message": log_message,
+        "coordinates": coordinates
+    }
+    try:
+        webhook_url = Settings.query.first().webhook_url
+        if webhook_url:
+            requests.post(webhook_url, json=payload)
+    except Exception as e:
+        print(f"[Webhook Error] {e}")
+    return jsonify({"status": "ok", "message": "Structured log received"})
+
+
+
+
+
+
+
+# User management routes (unchanged)
+@app.route('/create_user', methods=['GET', 'POST'])
+@admin_required
+def create_user():
+    if request.method == 'POST':
+        data = request.json if request.is_json else request.form
+        username = data.get('username')
+        password = data.get('password')
+        role = data.get('role', 'user')
+
+        if not username or not password:
+            return jsonify({"status": "error", "message": "Username and password are required"}), 400
+
+        if User.query.filter_by(username=username).first():
+            return jsonify({"status": "error", "message": "Username already exists"}), 400
+
+        hashed_password = generate_password_hash(password)
+        new_user = User(username=username, password=hashed_password, role=role)
+
+        try:
+            db.session.add(new_user)
+            db.session.commit()
+            log_activity_event(f"New user '{username}' created by {session.get('username')}")
+            return jsonify({"status": "success", "message": "User created successfully"})
+        except Exception as e:
+            db.session.rollback()
+            return jsonify({"status": "error", "message": str(e)}), 500
+
+    return render_template('manage_users.html')
+
+@app.route('/users', methods=['GET'])
+@login_required
+def get_users():
+    # Fetch all users from the database
+    users = User.query.all()
+    
+    # Convert users to a dictionary that can be easily converted to JSON
+    users_list = [{"id": user.id, "username": user.username, "role": user.role} for user in users]
+    
+    # Return the list as a JSON response
+    return jsonify(users_list)
+
+@app.route('/update_webhook', methods=['POST'])
+@login_required
+@admin_required
+def update_webhook():
+    webhook_url = request.json.get('webhook_url')
+    if webhook_url:
+        settings = Settings.query.first()
+        if settings:
+            settings.webhook_url = webhook_url
+        else:
+            settings = Settings(webhook_url=webhook_url)
+            db.session.add(settings)
+        db.session.commit()
+
+        log_activity_event(f"Webhook URL updated by {session.get('username')}")
+
+        return jsonify({"status": "success", "message": "Webhook URL updated successfully"})
+    return jsonify({"status": "error", "message": "Webhook URL is required"}), 400
+
+
+@app.route('/save_webhook', methods=['POST'])
+@login_required
+def save_webhook():
+    webhook_url = request.json.get('webhook_url')
+    if webhook_url:
+        try:
+            settings = Settings.query.first()
+            if settings:
+                settings.webhook_url = webhook_url
+            else:
+                settings = Settings(webhook_url=webhook_url)
+                db.session.add(settings)
+            db.session.commit()
+            return jsonify({"status": "success", "message": "Webhook URL saved successfully"}), 200
+        except Exception as e:
+            db.session.rollback()
+            return jsonify({"status": "error", "message": f"Error saving webhook: {e}"}), 500
+    else:
+        return jsonify({"status": "error", "message": "Webhook URL is required"}), 400
+
+# Authentication routes (unchanged)
+@app.route('/login', methods=['GET', 'POST'])
+def login():
+    if 'user_id' in session:
+        return redirect(url_for('index'))
+    if request.method == 'POST':
+        username = request.form.get('username')
+        password = request.form.get('password')
+        user = User.query.filter_by(username=username).first()
+        if user and check_password_hash(user.password, password):
+            session['user_id'] = user.id
+            session['username'] = user.username
+            session['role'] = user.role
+            return redirect(url_for('index'))
+        else:
+            flash('Invalid username or password', 'error')
+    return render_template('login.html')
+@app.route('/running_streams')
+@login_required
+def running_streams():
+    # Return list of currently active camera names
+    active_cameras = [name for name, worker in camera_workers.items() if worker.running.is_set()]
+    return jsonify(active_cameras)
+
+@app.route('/logout')
+def logout():
+    session.clear()
+    return redirect(url_for('login'))
+
+@app.route('/')
+@login_required
+def index():
+    return render_template('modern_index.html', cameras=cameras.keys(), username=session.get('username'), role=session.get('role'))
+
+@app.route('/device_info')
+@login_required
+def device_info_page():
+    info = get_device_relevant_info(cameras)
+    return render_template('device_info.html', info=info)
+
+
+
+
+
+
+@app.route('/add_camera', methods=['POST'])
+@login_required
+def add_camera():
+    data = request.get_json(silent=True) or request.form
+    camera_id = data.get("camera_id")
+    url = data.get("url") or data.get("camera_url")
+
+    if camera_id and url:
+        with cameras_lock:
+            if camera_id not in cameras:
+                cameras[camera_id] = url
+                print(f"[CAMERA ADDED] {camera_id}: {url}")
+            else:
+                print(f"[SKIPPED] Camera {camera_id} already exists")
+    return jsonify(success=True)
+
+
+
+
+
+
+
+from flask import jsonify
+
+@app.route("/gpu_info")
+def gpu_info():
+    gpu_data = get_gpu_info_jetson()
+    if gpu_data:
+        return jsonify(gpu_data)
+    return jsonify({"error": "Failed to get GPU data"}), 500
+
+
+
+@app.route('/recent_activities')
+@login_required
+def recent_activities_endpoint():
+    return jsonify(recent_activities)
+
+
+
+@app.route('/camera_health')
+@login_required
+def camera_health():
+    camera_data = get_all_camera_health()
+    return render_template('camera_health.html', camera_data=camera_data)
+
+@app.route('/camera_health_data')
+def camera_health_data():
+    data = list(camera_status_cache.values())
+    if not data:
+        with cameras_lock:
+            for cam_id, rtsp_url in cameras.items():
+                camera_status_cache[cam_id] = {
+                    "name": cam_id,
+                    "rtsp_url": rtsp_url,
+                    "status": "unknown",
+                    "last_seen": "Never",
+                    "fps": "N/A",
+                    "latency": "N/A",
+                }
+        data = list(camera_status_cache.values())
+    # (optional) stable sort by name
+    data.sort(key=lambda x: x.get("name", ""))
+    return jsonify(data)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+@app.route("/configuration")
+@login_required
+def configuration():
+    webhook_settings = Settings.query.first()
+    email_settings = MailSettings.query.first()
+
+    webhook_url = webhook_settings.webhook_url if webhook_settings else ""
+
+    return render_template(
+        "configuration.html",
+        webhook_url=webhook_url,
+        sender_email=email_settings.sender_email if email_settings else "",
+        receiver_email=email_settings.receiver_email if email_settings else ""
+    )
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+@app.route('/save_mail_settings', methods=['POST'])
+@login_required
+@admin_required
+def save_mail_settings():
+    data = request.get_json()
+    sender_email = data.get('sender_email')
+    sender_passkey = data.get('sender_passkey')
+    receiver_email = data.get('receiver_email')
+    offline_threshold = data.get('offline_threshold', 30)
+
+    if not sender_email or not sender_passkey or not receiver_email:
+        return jsonify({"status": "error", "message": "All fields are required"}), 400
+
+    try:
+        settings = MailSettings.query.first()
+        if settings:
+            settings.sender_email = sender_email
+            settings.sender_passkey = sender_passkey
+            settings.receiver_email = receiver_email
+            settings.offline_threshold = offline_threshold
+        else:
+            settings = MailSettings(
+                sender_email=sender_email,
+                sender_passkey=sender_passkey,
+                receiver_email=receiver_email,
+                offline_threshold=offline_threshold
+            )
+            db.session.add(settings)
+        db.session.commit()
+        return jsonify({"status": "success", "message": "Mail settings saved successfully"})
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+
+
+
+@app.route('/system_info')
+@login_required
+def system_info():
+    cpu_usage = psutil.cpu_percent(interval=1)
+    memory = psutil.virtual_memory()
+    memory_usage = memory.percent
+    disk_usage = psutil.disk_usage('/').percent
+    network_info = psutil.net_if_addrs()
+    ip_address = network_info.get('eth0', [{}])[0].get('address', 'N/A')
+
+    return jsonify({
+        "cpu_usage": cpu_usage,
+        "memory_usage": memory_usage,
+        "disk_usage": disk_usage,
+        "ip_address": ip_address
+    })
+
+with app.app_context():
+    db.create_all()
+
+if __name__ == '__main__':
+    health_thread = threading.Thread(target=background_camera_health_checker, daemon=True)
+    health_thread.start()
+    app.run(host='0.0.0.0', port=5002, threaded=True)
