@@ -26,13 +26,16 @@ Clone and build the image:
 git clone --recursive https://github.com/dusty-nv/jetson-inference
 cd jetson-inference/docker
 ./docker_build.sh
-Managing the MySQL Database
+
+
+## Managing the MySQL Database
 
 To connect to the MySQL database inside the container:
 mysql -u root -p
 Password: root
 
-#Useful commands:
+## 
+Useful commands:
 
 SHOW DATABASES;
 
