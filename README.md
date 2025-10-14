@@ -34,8 +34,7 @@ To connect to the MySQL database inside the container:
 mysql -u root -p
 Password: root
 
-## 
-Useful commands:
+## Useful commands:
 
 SHOW DATABASES;
 
