@@ -1,4 +1,4 @@
- # SynergyAI Application User Guide on Jetson
+ #   Application User Guide on Jetson
 
 ## Introduction
 This document presents the steps to launch the application, modify the source code, install the Docker image with PyTorch, and manage the MySQL database.
